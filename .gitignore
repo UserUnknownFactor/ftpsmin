@@ -1,0 +1,50 @@
+# Build outputs
+*.exe
+*.msi
+*.obj
+*.o
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.dll
+
+# Build directories
+build/
+build-*/
+release/
+Debug/
+Release/
+x64/
+x86/
+
+# IDE files
+.vs/
+*.vcxproj
+*.vcxproj.*
+*.sln
+*.suo
+*.user
+*.ncb
+*.aps
+
+# VS Code
+.vscode/
+
+# SSL certificates (don't commit these!)
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*~
+/src/opnssl/include/openssl
+*.old
+*.json

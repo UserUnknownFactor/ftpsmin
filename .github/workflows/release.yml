@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build Release Artifacts
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Get version
+      id: version
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Setup MSVC
+      uses: microsoft/setup-msbuild@v1.3
+
+    - name: Setup Visual Studio Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: Cache OpenSSL x64
+      id: cache-openssl-x64
+      uses: actions/cache@v3
+      with:
+        path: C:\OpenSSL
+        key: Win64OpenSSL-3_6_0
+
+    - name: Download OpenSSL x64
+      if: steps.cache-openssl-x64.outputs.cache-hit != 'true'
+      shell: powershell
+      run: |
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri "https://slproweb.com/download/Win64OpenSSL-3_6_0.exe" -OutFile "openssl-installer.exe"
+        Start-Process -FilePath "openssl-installer.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=C:\OpenSSL" -Wait
+
+    - name: Build x64
+      shell: cmd
+      run: |
+        mkdir build-x64
+        cd build-x64
+        cl /nologo /O2 /W3 /MD /D_CRT_SECURE_NO_WARNINGS /DWIN32 /D_WINDOWS /D_WIN64 ^
+           /IC:\OpenSSL\include ^
+           /Fe:ftpsmin.exe ^
+           ..\src\ftpsmin.c ..\src\config.c ..\src\service.c ^
+           ..\src\ssl_support.c ..\src\utf8_support.c ..\src\vfs.c ^
+           /link /LIBPATH:C:\OpenSSL\lib\VC\x64\MT ^
+           libssl.lib libcrypto.lib ws2_32.lib advapi32.lib user32.lib crypt32.lib
+
+    - name: Setup MSVC x86
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x86
+
+    - name: Cache OpenSSL x86
+      id: cache-openssl-x86
+      uses: actions/cache@v3
+      with:
+        path: C:\OpenSSL-x86
+        key: Win32OpenSSL-3_6_0
+
+    - name: Download OpenSSL x86
+      if: steps.cache-openssl-x86.outputs.cache-hit != 'true'
+      shell: powershell
+      run: |
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri "https://slproweb.com/download/Win32OpenSSL-3_6_0.exe" -OutFile "openssl-installer-x86.exe"
+        Start-Process -FilePath "openssl-installer-x86.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=C:\OpenSSL-x86" -Wait
+
+    - name: Build x86
+      shell: cmd
+      run: |
+        mkdir build-x86
+        cd build-x86
+        cl /nologo /O2 /W3 /MD /D_CRT_SECURE_NO_WARNINGS /DWIN32 /D_WINDOWS ^
+           /IC:\OpenSSL-x86\include ^
+           /Fe:ftpsmin.exe ^
+           ..\src\ftpsmin.c ..\src\config.c ..\src\service.c ^
+           ..\src\ssl_support.c ..\src\utf8_support.c ..\src\vfs.c ^
+           /link /LIBPATH:C:\OpenSSL-x86\lib\VC\x86\MT ^
+           libssl.lib libcrypto.lib ws2_32.lib advapi32.lib user32.lib crypt32.lib
+
+    - name: Create release packages
+      shell: powershell
+      run: |
+        $version = "${{ steps.version.outputs.version }}"
+        
+        # x64 package
+        New-Item -ItemType Directory -Path "release\ftpsmin-$version-win64" -Force
+        Copy-Item "build-x64\ftpsmin.exe" "release\ftpsmin-$version-win64\"
+        Copy-Item "README.md" "release\ftpsmin-$version-win64\" -ErrorAction SilentlyContinue
+        Copy-Item "LICENSE" "release\ftpsmin-$version-win64\" -ErrorAction SilentlyContinue
+        
+        # Generate sample config
+        Push-Location "release\ftpsmin-$version-win64"
+        #.\ftpsmin.exe -genconfig
+        #Rename-Item "ftpsmin.json" "ftpsmin.json.example"
+        Pop-Location
+        
+        # Create zip
+        Compress-Archive -Path "release\ftpsmin-$version-win64" -DestinationPath "release\ftpsmin-$version-win64.zip"
+        
+        # x86 package
+        New-Item -ItemType Directory -Path "release\ftpsmin-$version-win32" -Force
+        Copy-Item "build-x86\ftpsmin.exe" "release\ftpsmin-$version-win32\"
+        Copy-Item "README.md" "release\ftpsmin-$version-win32\" -ErrorAction SilentlyContinue
+        Copy-Item "LICENSE" "release\ftpsmin-$version-win32\" -ErrorAction SilentlyContinue
+        
+        Push-Location "release\ftpsmin-$version-win32"
+        #.\ftpsmin.exe -genconfig
+        #Rename-Item "ftpsmin.json" "ftpsmin.json.example"
+        Pop-Location
+        
+        Compress-Archive -Path "release\ftpsmin-$version-win32" -DestinationPath "release\ftpsmin-$version-win32.zip"
+
+    - name: Generate checksums
+      shell: powershell
+      run: |
+        cd release
+        $files = Get-ChildItem -Filter "*.zip"
+        $checksums = foreach ($file in $files) {
+          $hash = Get-FileHash -Path $file.FullName -Algorithm SHA256
+          "$($hash.Hash)  $($file.Name)"
+        }
+        $checksums | Out-File -Encoding UTF8 "checksums-sha256.txt"
+        Get-Content "checksums-sha256.txt"
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        name: ftpsmin v${{ steps.version.outputs.version }}
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+        files: |
+          release/*.zip
+          release/checksums-sha256.txt
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
