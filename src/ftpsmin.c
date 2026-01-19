@@ -38,6 +38,7 @@
 ServerConfig g_Config;
 BOOL g_RunAsService = FALSE;
 BOOL g_ServiceStop = FALSE;
+volatile LONG g_ConnectionCount = 0;
 
 struct in_addr OurAddr;
 char OurAddrStr[20];
@@ -230,26 +231,43 @@ void LogMessage(const char *format, ...)
 {
     va_list args;
     char timestamp[32];
+    char message[2048];
     time_t now;
     struct tm *tm_info;
-
-    if (g_RunAsService) {
-        // Could log to Windows Event Log or file here
-        return;
-    }
 
     time(&now);
     tm_info = localtime(&now);
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
 
-    printf("[%s] ", timestamp);
-
     va_start(args, format);
-    vprintf(format, args);
+    vsnprintf(message, sizeof(message), format, args);
     va_end(args);
 
-    printf("\n");
-    fflush(stdout);
+    // Console output (if not running as service)
+    if (!g_RunAsService) {
+        printf("[%s] %s\n", timestamp, message);
+        fflush(stdout);
+    }
+
+    // File logging
+    if (g_Config.logFile[0] != '\0' && g_Config.logLevel > 0) {
+        FILE *logFile = fopen(g_Config.logFile, "a");
+        if (logFile) {
+            fprintf(logFile, "[%s] %s\n", timestamp, message);
+            fclose(logFile);
+        }
+    }
+
+    // Windows Event Log (when running as service)
+    if (g_RunAsService && g_Config.logLevel >= 2) {
+        HANDLE hEventLog = RegisterEventSourceA(NULL, 
+            g_Config.serviceName[0] ? g_Config.serviceName : "ftpsmin");
+        if (hEventLog) {
+            const char *strings[1] = { message };
+            ReportEventA(hEventLog, EVENTLOG_INFORMATION_TYPE, 0, 0, NULL, 1, 0, strings, NULL);
+            DeregisterEventSource(hEventLog);
+        }
+    }
 }
 
 //------------------------------------------------------------------------------------
@@ -350,6 +368,7 @@ static SOCKET ConnectTcpip(struct sockaddr_in *addr, int addrlen)
     struct timeval timeout;
     fd_set writefds;
     u_long nonBlocking = 1;
+    int timeout_sec = g_Config.transferTimeout > 0 ? g_Config.transferTimeout : 30;
 
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
@@ -371,7 +390,7 @@ static SOCKET ConnectTcpip(struct sockaddr_in *addr, int addrlen)
         // Wait for connection with timeout
         FD_ZERO(&writefds);
         FD_SET(sock, &writefds);
-        timeout.tv_sec = 30;
+        timeout.tv_sec = timeout_sec;
         timeout.tv_usec = 0;
 
         if (select(0, NULL, &writefds, NULL, &timeout) <= 0) {
@@ -413,95 +432,6 @@ static void SendReply(Inst_t *Conn, const char *Reply)
 
     snprintf(ReplyStr, sizeof(ReplyStr), "%s\r\n", Reply);
     SecureSend(Conn, Conn->CommandSocket, ReplyStr, (int)strlen(ReplyStr), Conn->ssl);
-}
-
-//------------------------------------------------------------------------------------
-// Get a FTP command from the command stream
-//------------------------------------------------------------------------------------
-static CmdTypes GetCommand(Inst_t *Conn, char *CmdArg, const CommandDef **cmdDef)
-{
-    char InputString[2048];
-    int CmdLen;
-    char Command[8];
-    int a, b;
-
-    *cmdDef = NULL;
-    CmdArg[0] = '\0';
-
-    CmdLen = 0;
-    memset(InputString, 0, sizeof(InputString));
-
-    for (;;) {
-        int n;
-        fd_set readfds;
-        struct timeval timeout;
-
-        // Check for shutdown
-        if (g_ServiceStop) {
-            SendReply(Conn, "421 Server shutting down");
-            Sleep(100);
-            return (CmdTypes)-1;
-        }
-
-        FD_ZERO(&readfds);
-        FD_SET(Conn->CommandSocket, &readfds);
-        timeout.tv_sec = 1;  // 1 second
-        timeout.tv_usec = 0;
-
-        n = select(0, &readfds, NULL, NULL, &timeout);
-        if (n < 0) {
-            return (CmdTypes)-1;  // Socket error
-        }
-        if (n == 0) {
-            continue;  // Timeout - loop back and check g_ServiceStop
-        }
-
-        // Data available, read it
-        n = SecureRecv(Conn, Conn->CommandSocket, InputString + CmdLen,
-                       (int)(sizeof(InputString) - CmdLen - 1), Conn->ssl);
-        if (n <= 0) return (CmdTypes)-1;
-
-        CmdLen += n;
-        InputString[CmdLen] = '\0';
-        if (strstr(InputString, "\r\n") || strstr(InputString, "\n")) break;
-        if (CmdLen >= (int)(sizeof(InputString) - 1)) break;
-    }
-
-    // Parse command (up to 4 characters)
-    memset(Command, 0, sizeof(Command));
-    for (a = 0; a < 4 && InputString[a]; a++) {
-        if (!isalpha((unsigned char)InputString[a])) break;
-        Command[a] = (char)toupper((unsigned char)InputString[a]);
-    }
-
-    // Skip command and space, get argument
-    b = 0;
-    while (InputString[a] == ' ') a++;
-    for (b = 0; b < MAX_PATH * 3 - 1; b++) {
-        if (InputString[a + b] == '\r' || InputString[a + b] == '\n' ||
-            InputString[a + b] == '\0') break;
-        CmdArg[b] = InputString[a + b];
-    }
-    CmdArg[b] = '\0';
-
-    // Trim trailing spaces from argument
-    while (b > 0 && CmdArg[b-1] == ' ') {
-        CmdArg[--b] = '\0';
-    }
-
-    if (_stricmp(Command, "PASS") == 0) {
-        LogMessage("< PASS *******");
-    } else {
-        LogMessage("< %s %s", Command, CmdArg);
-    }
-
-    *cmdDef = FindCommand(Command);
-    if (*cmdDef) {
-        return (*cmdDef)->CmdNum;
-    }
-
-    LogMessage("Unknown command: %s", Command);
-    return UNKNOWN_COMMAND;
 }
 
 //------------------------------------------------------------------------------------
@@ -558,7 +488,7 @@ static void SendError(Inst_t *Conn, int code, const char *message)
         snprintf(ErrString, sizeof(ErrString), "%d %s", code, message);
     } else {
         FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
-                       NULL, err, 0, (LPSTR)&msgBuf, 0, NULL);
+                      NULL, err, 0, (LPSTR)&msgBuf, 0, NULL);
 
         if (msgBuf) {
             char *p = msgBuf + strlen(msgBuf) - 1;
@@ -604,6 +534,7 @@ static SSL* CreateDataSSL(SOCKET sock)
 static SOCKET OpenDataConnection(Inst_t *Conn, SSL **data_ssl)
 {
     SOCKET xfer_sock;
+    int timeout_sec = g_Config.transferTimeout > 0 ? g_Config.transferTimeout : 60;
 
     *data_ssl = NULL;
 
@@ -613,7 +544,7 @@ static SOCKET OpenDataConnection(Inst_t *Conn, SSL **data_ssl)
 
         FD_ZERO(&readfds);
         FD_SET(Conn->PassiveSocket, &readfds);
-        timeout.tv_sec = 60;
+        timeout.tv_sec = timeout_sec;
         timeout.tv_usec = 0;
 
         if (select(0, &readfds, NULL, NULL, &timeout) <= 0) {
@@ -631,6 +562,13 @@ static SOCKET OpenDataConnection(Inst_t *Conn, SSL **data_ssl)
         if (xfer_sock == INVALID_SOCKET) {
             return INVALID_SOCKET;
         }
+    }
+
+    // Set socket timeout for transfers
+    if (g_Config.transferTimeout > 0) {
+        DWORD timeout_ms = g_Config.transferTimeout * 1000;
+        setsockopt(xfer_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout_ms, sizeof(timeout_ms));
+        setsockopt(xfer_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout_ms, sizeof(timeout_ms));
     }
 
     // Set up SSL for data channel if required
@@ -675,7 +613,7 @@ static void FormatMlstTime(FILETIME *ft, char *buf, size_t bufSize)
 // Format file entry for MLST/MLSD
 //------------------------------------------------------------------------------------
 static void FormatMlstEntry(VFS_DirEntry *entry, char *buf, size_t bufSize, 
-                            BOOL includePathPrefix, const char *path)
+                           BOOL includePathPrefix, const char *path)
 {
     char timeStr[32];
     char typeStr[32];
@@ -696,15 +634,114 @@ static void FormatMlstEntry(VFS_DirEntry *entry, char *buf, size_t bufSize,
 
     if (entry->isDirectory) {
         snprintf(buf, bufSize, "%s;%s;modify=%s; %s%s",
-                 typeStr, permStr, timeStr,
-                 includePathPrefix && path ? path : "",
-                 entry->name);
+                typeStr, permStr, timeStr,
+                includePathPrefix && path ? path : "",
+                entry->name);
     } else {
         snprintf(buf, bufSize, "%s;%s;size=%llu;modify=%s; %s%s",
-                 typeStr, permStr, entry->size, timeStr,
-                 includePathPrefix && path ? path : "",
-                 entry->name);
+                typeStr, permStr, entry->size, timeStr,
+                includePathPrefix && path ? path : "",
+                entry->name);
     }
+}
+
+//------------------------------------------------------------------------------------
+// Get a FTP command from the command stream
+//------------------------------------------------------------------------------------
+static CmdTypes GetCommand(Inst_t *Conn, char *CmdArg, const CommandDef **cmdDef)
+{
+    char InputString[2048];
+    int CmdLen;
+    char Command[8];
+    int a, b;
+    DWORD idleStart = GetTickCount();
+
+    *cmdDef = NULL;
+    CmdArg[0] = '\0';
+
+    CmdLen = 0;
+    memset(InputString, 0, sizeof(InputString));
+
+    for (;;) {
+        int n;
+        fd_set readfds;
+        struct timeval timeout;
+
+        // Check for shutdown
+        if (g_ServiceStop) {
+            SendReply(Conn, "421 Server shutting down");
+            Sleep(100);
+            return (CmdTypes)-1;
+        }
+
+        // Check for idle timeout
+        if (g_Config.idleTimeout > 0) {
+            DWORD elapsed = (GetTickCount() - idleStart) / 1000;
+            if (elapsed >= (DWORD)g_Config.idleTimeout) {
+                SendReply(Conn, "421 Idle timeout, closing connection");
+                return (CmdTypes)-1;
+            }
+        }
+
+        FD_ZERO(&readfds);
+        FD_SET(Conn->CommandSocket, &readfds);
+        timeout.tv_sec = 1;  // 1 second
+        timeout.tv_usec = 0;
+
+        n = select(0, &readfds, NULL, NULL, &timeout);
+        if (n < 0) {
+            return (CmdTypes)-1;  // Socket error
+        }
+        if (n == 0) {
+            continue;  // Timeout - loop back and check g_ServiceStop and idle timeout
+        }
+
+        // Data available, read it
+        n = SecureRecv(Conn, Conn->CommandSocket, InputString + CmdLen,
+                      (int)(sizeof(InputString) - CmdLen - 1), Conn->ssl);
+        if (n <= 0) return (CmdTypes)-1;
+
+        CmdLen += n;
+        InputString[CmdLen] = '\0';
+        if (strstr(InputString, "\r\n") || strstr(InputString, "\n")) break;
+        if (CmdLen >= (int)(sizeof(InputString) - 1)) break;
+    }
+
+    // Parse command (up to 4 characters)
+    memset(Command, 0, sizeof(Command));
+    for (a = 0; a < 4 && InputString[a]; a++) {
+        if (!isalpha((unsigned char)InputString[a])) break;
+        Command[a] = (char)toupper((unsigned char)InputString[a]);
+    }
+
+    // Skip command and space, get argument
+    b = 0;
+    while (InputString[a] == ' ') a++;
+    for (b = 0; b < MAX_PATH * 3 - 1; b++) {
+        if (InputString[a + b] == '\r' || InputString[a + b] == '\n' ||
+            InputString[a + b] == '\0') break;
+        CmdArg[b] = InputString[a + b];
+    }
+    CmdArg[b] = '\0';
+
+    // Trim trailing spaces from argument
+    while (b > 0 && CmdArg[b-1] == ' ') {
+        CmdArg[--b] = '\0';
+    }
+
+    if (_stricmp(Command, "PASS") == 0) {
+        LogMessage("< PASS *******");
+    } else {
+        LogMessage("< %s %s", Command, CmdArg);
+    }
+
+    *cmdDef = FindCommand(Command);
+    if (*cmdDef) {
+        return (*cmdDef)->CmdNum;
+    }
+
+    LogMessage("Unknown command: %s", Command);
+    return UNKNOWN_COMMAND;
 }
 
 //------------------------------------------------------------------------------------
@@ -913,7 +950,7 @@ static void Cmd_RETR(Inst_t *Conn, char *filename)
     LARGE_INTEGER seekPos;
 
     file = VFS_CreateFile(Conn->CurrentDir, filename, GENERIC_READ, FILE_SHARE_READ,
-                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
 
     if (file == INVALID_HANDLE_VALUE) {
         Send550Error(Conn);
@@ -944,10 +981,10 @@ static void Cmd_RETR(Inst_t *Conn, char *filename)
 
     if (Conn->RestartOffset > 0) {
         SendReplyFmt(Conn, "150 Opening BINARY mode data connection for %s (%lld bytes, restarting at %lld)",
-                     filename, fileSize.QuadPart, Conn->RestartOffset);
+                    filename, fileSize.QuadPart, Conn->RestartOffset);
     } else {
         SendReplyFmt(Conn, "150 Opening BINARY mode data connection for %s (%lld bytes)",
-                     filename, fileSize.QuadPart);
+                    filename, fileSize.QuadPart);
     }
 
     xfer_sock = OpenDataConnection(Conn, &data_ssl);
@@ -960,17 +997,27 @@ static void Cmd_RETR(Inst_t *Conn, char *filename)
 
     // Transfer file
     BOOL success = TRUE;
-    while (ReadFile(file, Conn->XferBuffer, sizeof(Conn->XferBuffer), &bytesRead, NULL)
-           && bytesRead > 0) {
-        int sent = SecureSend(Conn, xfer_sock, Conn->XferBuffer, (int)bytesRead, data_ssl);
-        if (sent < 0) {
-            LogMessage("Send failed during transfer");
-            SendError(Conn, 426, "Connection closed; transfer aborted");
-            success = FALSE;
-            break;
+
+    LONGLONG bytesToTransfer = fileSize.QuadPart - Conn->RestartOffset;
+
+    if (bytesToTransfer == 0) {
+        // For 0-byte files or when REST offset equals file size, 
+        // we still need to properly complete the transfer
+        LogMessage("Sending empty file (0 bytes)");
+    } else {
+        // Normal transfer loop for non-empty files
+        while (ReadFile(file, Conn->XferBuffer, sizeof(Conn->XferBuffer), &bytesRead, NULL)
+               && bytesRead > 0) {
+            int sent = SecureSend(Conn, xfer_sock, Conn->XferBuffer, (int)bytesRead, data_ssl);
+            if (sent < 0) {
+                LogMessage("Send failed during transfer");
+                SendError(Conn, 426, "Connection closed; transfer aborted");
+                success = FALSE;
+                break;
+            }
+            totalBytes += bytesRead;
+            Conn->BytesSent += bytesRead;
         }
-        totalBytes += bytesRead;
-        Conn->BytesSent += bytesRead;
     }
 
     CloseDataConnection(xfer_sock, data_ssl);
@@ -1029,7 +1076,7 @@ static void Cmd_STOR(Inst_t *Conn, char *filename, BOOL append, BOOL unique)
 
         while (VFS_GetFileInfo(Conn->CurrentDir, actualFilename, &info)) {
             snprintf(actualFilename, sizeof(actualFilename), "%s.%d%s", 
-                     baseName, counter++, ext);
+                    baseName, counter++, ext);
             if (counter > 10000) {
                 SendError(Conn, 452, "Cannot create unique filename");
                 return;
@@ -1049,7 +1096,7 @@ static void Cmd_STOR(Inst_t *Conn, char *filename, BOOL append, BOOL unique)
     }
 
     file = VFS_CreateFile(Conn->CurrentDir, actualFilename, GENERIC_WRITE, 0,
-                          creation, flags);
+                         creation, flags);
 
     if (file == INVALID_HANDLE_VALUE) {
         Send550Error(Conn);
@@ -1077,7 +1124,7 @@ static void Cmd_STOR(Inst_t *Conn, char *filename, BOOL append, BOOL unique)
         SendReplyFmt(Conn, "150 FILE: %s", actualFilename);
     } else if (Conn->RestartOffset > 0) {
         SendReplyFmt(Conn, "150 Opening BINARY mode data connection for %s (restarting at %lld)",
-                     actualFilename, Conn->RestartOffset);
+                    actualFilename, Conn->RestartOffset);
     } else {
         SendReplyFmt(Conn, "150 Opening BINARY mode data connection for %s", actualFilename);
     }
@@ -1094,7 +1141,7 @@ static void Cmd_STOR(Inst_t *Conn, char *filename, BOOL append, BOOL unique)
     BOOL success = TRUE;
     for (;;) {
         size = SecureRecv(Conn, xfer_sock, Conn->XferBuffer,
-                          sizeof(Conn->XferBuffer), data_ssl);
+                         sizeof(Conn->XferBuffer), data_ssl);
         if (size <= 0) break;
 
         if (!WriteFile(file, Conn->XferBuffer, size, &bytesWritten, NULL) ||
@@ -1145,8 +1192,8 @@ static void Cmd_MDTM(Inst_t *Conn, char *arg)
 
             // Set file modification time
             HANDLE file = VFS_CreateFile(Conn->CurrentDir, filename, 
-                                         FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ,
-                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
+                                        FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
             if (file == INVALID_HANDLE_VALUE) {
                 Send550Error(Conn);
                 return;
@@ -1188,8 +1235,8 @@ static void Cmd_MDTM(Inst_t *Conn, char *arg)
 
     FileTimeToSystemTime(&fileInfo.ftLastWriteTime, &st);
     snprintf(reply, sizeof(reply), "213 %04d%02d%02d%02d%02d%02d",
-             st.wYear, st.wMonth, st.wDay,
-             st.wHour, st.wMinute, st.wSecond);
+            st.wYear, st.wMonth, st.wDay,
+            st.wHour, st.wMinute, st.wSecond);
     SendReply(Conn, reply);
 }
 
@@ -1674,7 +1721,7 @@ static void ProcessCommands(Inst_t *Conn)
                     }
 
                     snprintf(repbuf, sizeof(repbuf), "227 Entering Passive Mode (%s,%d,%d)",
-                             OurAddrStr, Conn->XferPort >> 8, Conn->XferPort & 0xff);
+                            OurAddrStr, Conn->XferPort >> 8, Conn->XferPort & 0xff);
 
                     for (a = 0; repbuf[a]; a++) {
                         if (repbuf[a] == '.') repbuf[a] = ',';
@@ -1751,7 +1798,7 @@ static void ProcessCommands(Inst_t *Conn)
                     char delim2, delim3, delim4;
 
                     if (sscanf(buf, "%c%d%c%63[^|]%c%d%c", 
-                               &delim, &protocol, &delim2, address, &delim3, &eprt_port, &delim4) != 7) {
+                              &delim, &protocol, &delim2, address, &delim3, &eprt_port, &delim4) != 7) {
                         SendError(Conn, 501, "Invalid EPRT command");
                         break;
                     }
@@ -1780,7 +1827,7 @@ static void ProcessCommands(Inst_t *Conn)
 
             case CWD:
                 if (!VFS_SetDirectory(Conn->CurrentDir, buf, Conn->CurrentDir,
-                                      sizeof(Conn->CurrentDir))) {
+                                     sizeof(Conn->CurrentDir))) {
                     SendError(Conn, 550, "Directory not found or access denied");
                 } else {
                     SendReply(Conn, "250 CWD command successful");
@@ -1789,7 +1836,7 @@ static void ProcessCommands(Inst_t *Conn)
 
             case CDUP:
                 if (!VFS_SetDirectory(Conn->CurrentDir, "..", Conn->CurrentDir,
-                                      sizeof(Conn->CurrentDir))) {
+                                     sizeof(Conn->CurrentDir))) {
                     SendError(Conn, 550, "Cannot go up from root");
                 } else {
                     SendReply(Conn, "250 CDUP command successful");
@@ -1872,8 +1919,8 @@ static void ProcessCommands(Inst_t *Conn)
                         SendReplyFmt(Conn, "257 \"%s\" directory created", buf);
                     } else {
                         SendReplyFmt(Conn, "257 \"%s/%s\" directory created", 
-                                     strcmp(Conn->CurrentDir, "/") == 0 ? "" : Conn->CurrentDir, 
-                                     buf);
+                                    strcmp(Conn->CurrentDir, "/") == 0 ? "" : Conn->CurrentDir, 
+                                    buf);
                     }
                 }
                 break;
@@ -1908,7 +1955,7 @@ static void ProcessCommands(Inst_t *Conn)
                 }
                 break;
 
-            case RNTO:
+                        case RNTO:
                 if (Conn->RenameFrom[0] == '\0') {
                     SendReply(Conn, "503 RNFR required first");
                     break;
@@ -1953,26 +2000,26 @@ static void ProcessCommands(Inst_t *Conn)
             case STAT:
                 if (buf[0] == '\0') {
                     DWORD uptime = (GetTickCount() - Conn->ConnectTime) / 1000;
-                                        snprintf(repbuf, sizeof(repbuf),
-                             "211-ftpsmin " FTPSMIN_VER " Server Status\r\n"
-                             " Connected to %s\r\n"
-                             " Logged in as %s\r\n"
-                             " Session time: %lu seconds\r\n"
-                             " TYPE: %s, STRU: File, MODE: Stream\r\n"
-                             " Data connection: %s\r\n"
-                             " TLS: %s, Data protection: %s\r\n"
-                             " UTF-8: %s\r\n"
-                             " Bytes sent: %llu, received: %llu\r\n"
-                             "211 End of status\r\n",
-                             OurAddrStr,
-                             Conn->Authenticated ? Conn->Username : "(not logged in)",
-                             uptime,
-                             Conn->Type == TRANSFER_TYPE_ASCII ? "ASCII" : "Binary",
-                             Conn->PassiveMode ? "Passive" : "Active",
-                             Conn->UseSSL ? "Active" : "Inactive",
-                             Conn->DataProtection ? "Private" : "Clear",
-                             Conn->UseUTF8 ? "Enabled" : "Disabled",
-                             Conn->BytesSent, Conn->BytesReceived);
+                    snprintf(repbuf, sizeof(repbuf),
+                            "211-ftpsmin " FTPSMIN_VER " Server Status\r\n"
+                            " Connected to %s\r\n"
+                            " Logged in as %s\r\n"
+                            " Session time: %lu seconds\r\n"
+                            " TYPE: %s, STRU: File, MODE: Stream\r\n"
+                            " Data connection: %s\r\n"
+                            " TLS: %s, Data protection: %s\r\n"
+                            " UTF-8: %s\r\n"
+                            " Bytes sent: %llu, received: %llu\r\n"
+                            "211 End of status\r\n",
+                            OurAddrStr,
+                            Conn->Authenticated ? Conn->Username : "(not logged in)",
+                            uptime,
+                            Conn->Type == TRANSFER_TYPE_ASCII ? "ASCII" : "Binary",
+                            Conn->PassiveMode ? "Passive" : "Active",
+                            Conn->UseSSL ? "Active" : "Inactive",
+                            Conn->DataProtection ? "Private" : "Clear",
+                            Conn->UseUTF8 ? "Enabled" : "Disabled",
+                            Conn->BytesSent, Conn->BytesReceived);
                     SendMultiLineReply(Conn, repbuf);
                 } else {
                     // STAT with path - directory listing over control connection
@@ -1997,7 +2044,7 @@ static void ProcessCommands(Inst_t *Conn)
                 {
                     DWORD sessionTime = (GetTickCount() - Conn->ConnectTime) / 1000;
                     LogMessage("Session ended. Duration: %lu seconds, Sent: %llu bytes, Received: %llu bytes",
-                               sessionTime, Conn->BytesSent, Conn->BytesReceived);
+                              sessionTime, Conn->BytesSent, Conn->BytesReceived);
                     SendReply(Conn, "221 Goodbye");
                     goto EndConnection;
                 }
@@ -2028,6 +2075,10 @@ EndConnection:
         closesocket(Conn->CommandSocket);
     }
     ReleasePassivePort(Conn->XferPort);
+
+    // Decrement connection count
+    InterlockedDecrement(&g_ConnectionCount);
+
     free(Conn);
 }
 
@@ -2050,13 +2101,13 @@ static unsigned __stdcall ConnectionThread(void *param)
 static BOOL WINAPI ConsoleHandler(DWORD signal)
 {
     switch (signal) {
-    case CTRL_C_EVENT:
-    case CTRL_BREAK_EVENT:
-    case CTRL_CLOSE_EVENT:
-    case CTRL_SHUTDOWN_EVENT:
-        LogMessage("Shutdown signal received");
-        g_ServiceStop = TRUE;
-        return TRUE;
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            LogMessage("Shutdown signal received");
+            g_ServiceStop = TRUE;
+            return TRUE;
     }
     return FALSE;
 }
@@ -2111,10 +2162,10 @@ void ServerMain(void)
         LogMessage("Virtual directories:");
         for (i = 0; i < g_Config.numVirtualDirs; i++) {
             LogMessage("  %s -> %s%s%s",
-                       g_Config.virtualDirs[i].virtualPath,
-                       g_Config.virtualDirs[i].physicalPath,
-                       g_Config.virtualDirs[i].readOnly ? " [read-only]" : "",
-                       g_Config.virtualDirs[i].hidden ? " [hidden]" : "");
+                g_Config.virtualDirs[i].virtualPath,
+                g_Config.virtualDirs[i].physicalPath,
+                g_Config.virtualDirs[i].readOnly ? " [read-only]" : "",
+                g_Config.virtualDirs[i].hidden ? " [hidden]" : "");
         }
     }
 
@@ -2161,12 +2212,12 @@ void ServerMain(void)
     LogMessage("ftpsmin " FTPSMIN_VER " started");
     LogMessage("========================================");
     LogMessage("Listening on %s://%s:%d",
-               g_Config.useTLS && g_Config.implicitTLS ? "ftps" : "ftp",
-               OurAddrStr, ControlPort);
+        g_Config.useTLS && g_Config.implicitTLS ? "ftps" : "ftp",
+        OurAddrStr, ControlPort);
 
     if (g_Config.passivePortStart > 0 && g_Config.passivePortEnd > 0) {
         LogMessage("Passive port range: %d-%d", 
-                   g_Config.passivePortStart, g_Config.passivePortEnd);
+            g_Config.passivePortStart, g_Config.passivePortEnd);
     }
 
     if (g_Config.requireAuth) {
@@ -2181,6 +2232,22 @@ void ServerMain(void)
 
     if (g_Config.defaultUtf8) {
         LogMessage("UTF-8 enabled by default");
+    }
+
+    if (g_Config.maxConnections > 0) {
+        LogMessage("Max connections: %d", g_Config.maxConnections);
+    }
+
+    if (g_Config.idleTimeout > 0) {
+        LogMessage("Idle timeout: %d seconds", g_Config.idleTimeout);
+    }
+
+    if (g_Config.transferTimeout > 0) {
+        LogMessage("Transfer timeout: %d seconds", g_Config.transferTimeout);
+    }
+
+    if (g_Config.logFile[0] != '\0') {
+        LogMessage("Logging to file: %s", g_Config.logFile);
     }
 
     LogMessage("Ready to accept connections");
@@ -2213,11 +2280,26 @@ void ServerMain(void)
             continue;
         }
 
+        if (g_Config.maxConnections > 0 && g_ConnectionCount >= g_Config.maxConnections) {
+            LogMessage("Connection limit reached (%d), rejecting connection from %s:%d",
+                g_Config.maxConnections,
+                inet_ntoa(clientAddr.sin_addr),
+                ntohs(clientAddr.sin_port));
+
+            const char *rejectMsg = "421 Too many connections, try again later\r\n";
+            send(CommandSocket, rejectMsg, (int)strlen(rejectMsg), 0);
+            closesocket(CommandSocket);
+            continue;
+        }
+
         connectionCount++;
-        LogMessage("Connection #%d from %s:%d",
-                   connectionCount,
-                   inet_ntoa(clientAddr.sin_addr),
-                   ntohs(clientAddr.sin_port));
+        InterlockedIncrement(&g_ConnectionCount);
+
+        LogMessage("Connection #%d from %s:%d (active: %ld)",
+            connectionCount,
+            inet_ntoa(clientAddr.sin_addr),
+            ntohs(clientAddr.sin_port),
+            g_ConnectionCount);
 
         // Set socket options
         {
@@ -2235,6 +2317,7 @@ void ServerMain(void)
         if (!Conn) {
             LogMessage("Out of memory allocating connection");
             closesocket(CommandSocket);
+            InterlockedDecrement(&g_ConnectionCount);
             continue;
         }
 
@@ -2258,7 +2341,18 @@ void ServerMain(void)
     // Cleanup
     LogMessage("Shutting down...");
 
-    Sleep(1000);
+    // Wait for connections to close
+    if (g_ConnectionCount > 0) {
+        LogMessage("Waiting for %ld active connection(s) to close...", g_ConnectionCount);
+        int waitCount = 0;
+        while (g_ConnectionCount > 0 && waitCount < 30) {  // up to 30 seconds
+            Sleep(1000);
+            waitCount++;
+        }
+        if (g_ConnectionCount > 0) {
+            LogMessage("Forcing shutdown with %ld connection(s) still active", g_ConnectionCount);
+        }
+    }
 
     closesocket(sock);
 
@@ -2283,54 +2377,41 @@ static void PrintUsage(void)
     printf("Usage: ftpsmin [options]\n\n");
     printf("Options:\n");
     printf("  -c <file>     Use specified JSON config file (default: ftpsmin.json)\n");
+    printf("  -genconfig    Generate sample configuration file\n");
     printf("  -install      Install as Windows service\n");
     printf("  -uninstall    Uninstall Windows service\n");
     printf("  -start        Start the Windows service\n");
     printf("  -stop         Stop the Windows service\n");
     printf("  -status       Check Windows service status\n");
     printf("  -h, -help     Show this help message\n");
+    printf("  -version      Show version information\n");
     printf("\n");
-    printf("Quick start:\n");
-    printf("  1. Create ftpsmin.json configuration file\n");
-    printf("  2. Run: ftpsmin.exe\n");
-    printf("  3. Connect with any FTP client\n");
-    printf("\n");
-    printf("Example configuration (ftpsmin.json):\n");
-    printf("{\n");
-    printf("    \"port\": 21,\n");
-    printf("    \"virtualDirs\": [\n");
-    printf("        {\n");
-    printf("            \"virtual\": \"/files\",\n");
-    printf("            \"physical\": \"C:\\\\FTPRoot\",\n");
-    printf("            \"readOnly\": false\n");
-    printf("        },\n");
-    printf("        {\n");
-    printf("            \"virtual\": \"/backup\",\n");
-    printf("            \"physical\": \"D:\\\\Backup\",\n");
-    printf("            \"readOnly\": true\n");
-    printf("        }\n");
-    printf("    ],\n");
-    printf("    \"useTLS\": true,\n");
-    printf("    \"certFile\": \"server.crt\",\n");
-    printf("    \"keyFile\": \"server.key\",\n");
-    printf("    \"requireAuth\": true,\n");
-    printf("    \"username\": \"ftpuser\",\n");
-    printf("    \"password\": \"secretpassword\",\n");
-    printf("    \"passivePortStart\": 50000,\n");
-    printf("    \"passivePortEnd\": 50100,\n");
-    printf("    \"defaultUtf8\": true\n");
-    printf("}\n");
+    printf("Configuration options (ftpsmin.json):\n");
+    printf("  port              - Control port (default: 21)\n");
+    printf("  hostAddress       - External IP for NAT (default: auto-detect)\n");
+    printf("  getOnly           - Read-only mode (default: false)\n");
+    printf("  virtualDirs       - Array of virtual directory mappings\n");
+    printf("  passivePortStart  - Passive port range start\n");
+    printf("  passivePortEnd    - Passive port range end\n");
+    printf("  useTLS            - Enable TLS support (default: false)\n");
+    printf("  implicitTLS       - Use implicit TLS on port 990 (default: false)\n");
+    printf("  certFile          - SSL certificate file (default: server.crt)\n");
+    printf("  keyFile           - SSL private key file (default: server.key)\n");
+    printf("  requireAuth       - Require authentication (default: false)\n");
+    printf("  username          - Username for auth (default: Anonymous)\n");
+    printf("  password          - Password for auth (default: empty)\n");
+    printf("  defaultUtf8       - Enable UTF-8 by default (default: true)\n");
+    printf("  logFile           - Log file path (default: none)\n");
+    printf("  logLevel          - Log verbosity 0-3 (default: 2)\n");
+    printf("  maxConnections    - Max simultaneous connections (default: 10)\n");
+    printf("  idleTimeout       - Idle timeout in seconds (default: 300)\n");
+    printf("  transferTimeout   - Transfer timeout in seconds (default: 600)\n");
+    printf("  serviceName       - Windows service name (default: ftpsmin)\n");
+    printf("  serviceDisplayName - Service display name\n");
+    printf("  serviceDescription - Service description\n");
     printf("\n");
     printf("To generate SSL certificate:\n");
     printf("  openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes\n");
-    printf("\n");
-    printf("Features:\n");
-    printf("  - FTPS (FTP over TLS) - explicit and implicit modes\n");
-    printf("  - Multiple virtual directories with per-directory permissions\n");
-    printf("  - UTF-8 filename support\n");
-    printf("  - Resume transfers (REST command)\n");
-    printf("  - Windows Service support\n");
-    printf("  - MLSD/MLST for machine-readable listings\n");
     printf("\n");
 }
 
@@ -2369,8 +2450,8 @@ static int ServiceStatus(void)
     }
 
     schService = OpenService(schSCManager,
-                             g_Config.serviceName[0] ? g_Config.serviceName : "ftpsmin",
-                             SERVICE_QUERY_STATUS);
+                            g_Config.serviceName[0] ? g_Config.serviceName : "ftpsmin",
+                            SERVICE_QUERY_STATUS);
 
     if (!schService) {
         DWORD err = GetLastError();
@@ -2384,7 +2465,7 @@ static int ServiceStatus(void)
     }
 
     if (!QueryServiceStatusEx(schService, SC_STATUS_PROCESS_INFO,
-                              (LPBYTE)&status, sizeof(status), &bytesNeeded)) {
+                             (LPBYTE)&status, sizeof(status), &bytesNeeded)) {
         printf("Cannot query service status (error %d)\n", GetLastError());
         CloseServiceHandle(schService);
         CloseServiceHandle(schSCManager);
@@ -2403,8 +2484,8 @@ static int ServiceStatus(void)
     }
 
     printf("Service '%s' status: %s\n",
-           g_Config.serviceName[0] ? g_Config.serviceName : "ftpsmin",
-           stateStr);
+          g_Config.serviceName[0] ? g_Config.serviceName : "ftpsmin",
+          stateStr);
 
     if (status.dwCurrentState == SERVICE_RUNNING) {
         printf("Process ID: %d\n", status.dwProcessId);
@@ -2496,6 +2577,39 @@ static BOOL ValidateConfig(ServerConfig *config)
         }
     }
 
+    // Check timeouts
+    if (config->idleTimeout < 0) {
+        printf("Warning: Invalid idle timeout %d, using default\n", config->idleTimeout);
+        config->idleTimeout = 300;
+    }
+
+    if (config->transferTimeout < 0) {
+        printf("Warning: Invalid transfer timeout %d, using default\n", config->transferTimeout);
+        config->transferTimeout = 600;
+    }
+
+    // Check max connections
+    if (config->maxConnections < 0) {
+        printf("Warning: Invalid max connections %d, using default\n", config->maxConnections);
+        config->maxConnections = 10;
+    }
+
+    // Check log level
+    if (config->logLevel < 0 || config->logLevel > 3) {
+        printf("Warning: Invalid log level %d, using default\n", config->logLevel);
+        config->logLevel = 2;
+    }
+
+    // Check log file (if specified, try to open for writing)
+    if (config->logFile[0] != '\0') {
+        FILE *f = fopen(config->logFile, "a");
+        if (!f) {
+            printf("Warning: Cannot open log file '%s' for writing\n", config->logFile);
+        } else {
+            fclose(f);
+        }
+    }
+
     return valid;
 }
 
@@ -2540,12 +2654,20 @@ static void GenerateSampleConfig(const char *filename)
     fprintf(f, "    \n");
     fprintf(f, "    \"requireAuth\": true,\n");
     fprintf(f, "    \"username\": \"ftpuser\",\n");
-    fprintf(f, "    \"password\": \"changeme\",\n");
+    fprintf(f, "    \"password\": \"changeme123\",\n");
     fprintf(f, "    \n");
     fprintf(f, "    \"defaultUtf8\": true,\n");
     fprintf(f, "    \n");
+    fprintf(f, "    \"logFile\": \"\",\n");
+    fprintf(f, "    \"logLevel\": 2,\n");
+    fprintf(f, "    \n");
+    fprintf(f, "    \"maxConnections\": 10,\n");
+    fprintf(f, "    \"idleTimeout\": 300,\n");
+    fprintf(f, "    \"transferTimeout\": 600,\n");
+    fprintf(f, "    \n");
     fprintf(f, "    \"serviceName\": \"ftpsmin\",\n");
-    fprintf(f, "    \"serviceDisplayName\": \"FTPSMIN Secure FTP Server\"\n");
+    fprintf(f, "    \"serviceDisplayName\": \"FTPSMIN Secure FTP Server\",\n");
+    fprintf(f, "    \"serviceDescription\": \"Minimal secure FTP server with TLS, UTF-8 and virtual directory support\"\n");
     fprintf(f, "}\n");
 
     fclose(f);

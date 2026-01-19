@@ -7,17 +7,16 @@ CC = cl
 LINK = link
 RC = rc
 
+# Choose runtime: MDd (debug dynamic), MD (dynamic), MTd (debug static), MT (static)
+RUNTIME = MT
+
 # Compiler flags
 # /MT = static C runtime (no VCRUNTIME/MSVCRT DLL dependency)
-CFLAGS = /nologo /O2 /W3 /MT /D_CRT_SECURE_NO_WARNINGS /DWIN32 /D_WINDOWS
+CFLAGS = /nologo /O2 /W3 /$(RUNTIME) /D_CRT_SECURE_NO_WARNINGS /DWIN32 /D_WINDOWS
 
 # OpenSSL paths
 OPENSSL_DIR = .\opnssl
 OPENSSL_INC = $(OPENSSL_DIR)\include
-
-# Choose runtime: MDd (debug dynamic), MD (dynamic), MTd (debug static), MT (static)
-# Must match the /MT or /MD flag above
-RUNTIME = MT
 
 # Architecture: x64 or x86
 !IF "$(PLATFORM)" == "x86"
