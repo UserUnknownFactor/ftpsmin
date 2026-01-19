@@ -100,7 +100,7 @@ Example `ftpsmin.json`:
 | Option | Description | Default |
 |--------|-------------|---------|
 | `port` | Control port number | 21 |
-| `hostAddress` | External IP address (for NAT) | auto-detect |
+| `hostAddress` | External IP address (for NAT) | (empty/auto-detect) |
 | `passivePortStart` | Start of passive port range | 0 (random) |
 | `passivePortEnd` | End of passive port range | 0 (random) |
 | `virtualDirs` | Array of virtual directory mappings | [] |
@@ -109,14 +109,18 @@ Example `ftpsmin.json`:
 | `certFile` | Path to SSL certificate | server.crt |
 | `keyFile` | Path to SSL private key | server.key |
 | `requireAuth` | Require username/password | false |
-| `username` | Username for authentication | anonymous |
+| `username` | Username for authentication | Anonymous |
 | `password` | Password for authentication | (empty) |
 | `defaultUtf8` | Enable UTF-8 by default | true |
 | `getOnly` | Read-only mode (no uploads) | false |
+| `logFile` | Path to log file | (empty/disabled) |
+| `logLevel` | Log verbosity (0-3) | 2 |
 | `maxConnections` | Maximum simultaneous connections | 10 |
 | `idleTimeout` | Idle timeout in seconds | 300 |
+| `transferTimeout` | Transfer timeout in seconds | 600 |
 | `serviceName` | Windows service name | ftpsmin |
-
+| `serviceDisplayName` | Service display name | FTPSMIN Secure FTP Server |
+| `serviceDescription` | Service description | (see code) |
 ## Command Line Options
 
 ```

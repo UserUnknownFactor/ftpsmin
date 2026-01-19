@@ -33,107 +33,150 @@ jobs:
           echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
         fi
 
-    - name: Setup MSVC
-      uses: microsoft/setup-msbuild@v1.3
+    # Cache vcpkg packages to speed up builds
+    - name: Cache vcpkg packages
+      uses: actions/cache@v4
+      with:
+        path: |
+          C:\vcpkg\installed
+          C:\vcpkg\packages
+        key: vcpkg-openssl-static-${{ runner.os }}-v3
+        restore-keys: |
+          vcpkg-openssl-static-${{ runner.os }}-
 
-    - name: Setup Visual Studio Developer Command Prompt
+    - name: Install OpenSSL via vcpkg (both architectures)
+      shell: cmd
+      run: |
+        vcpkg integrate install
+        vcpkg install openssl:x64-windows-static
+        vcpkg install openssl:x86-windows-static
+
+    - name: Verify vcpkg OpenSSL installation
+      shell: cmd
+      run: |
+        echo === x64 Static Libraries ===
+        dir "C:\vcpkg\installed\x64-windows-static\lib\*.lib"
+        echo.
+        echo === x86 Static Libraries ===
+        dir "C:\vcpkg\installed\x86-windows-static\lib\*.lib"
+        echo.
+        echo === x64 Include ===
+        dir "C:\vcpkg\installed\x64-windows-static\include\openssl" | head -5
+
+    # ==================== BUILD x64 ====================
+    - name: Setup MSVC x64
       uses: ilammy/msvc-dev-cmd@v1
       with:
         arch: x64
-
-    - name: Cache OpenSSL x64
-      id: cache-openssl-x64
-      uses: actions/cache@v3
-      with:
-        path: C:\OpenSSL
-        key: Win64OpenSSL-3_6_0
-
-    - name: Download OpenSSL x64
-      if: steps.cache-openssl-x64.outputs.cache-hit != 'true'
-      shell: powershell
-      run: |
-        $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri "https://slproweb.com/download/Win64OpenSSL-3_6_0.exe" -OutFile "openssl-installer.exe"
-        Start-Process -FilePath "openssl-installer.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=C:\OpenSSL" -Wait
 
     - name: Build x64
       shell: cmd
       run: |
         mkdir build-x64
         cd build-x64
-        cl /nologo /O2 /W3 /MD /D_CRT_SECURE_NO_WARNINGS /DWIN32 /D_WINDOWS /D_WIN64 ^
-           /IC:\OpenSSL\include ^
+        
+        cl /nologo /O2 /W3 /MT /D_CRT_SECURE_NO_WARNINGS /DWIN32 /D_WINDOWS /D_WIN64 ^
+           /I"C:\vcpkg\installed\x64-windows-static\include" ^
            /Fe:ftpsmin.exe ^
-           ..\src\ftpsmin.c ..\src\config.c ..\src\service.c ^
-           ..\src\ssl_support.c ..\src\utf8_support.c ..\src\vfs.c ^
-           /link /LIBPATH:C:\OpenSSL\lib\VC\x64\MT ^
-           libssl.lib libcrypto.lib ws2_32.lib advapi32.lib user32.lib crypt32.lib
+           ..\src\ftpsmin.c ^
+           ..\src\config.c ^
+           ..\src\service.c ^
+           ..\src\ssl_support.c ^
+           ..\src\utf8_support.c ^
+           ..\src\vfs.c ^
+           /link /SUBSYSTEM:CONSOLE ^
+           /LIBPATH:"C:\vcpkg\installed\x64-windows-static\lib" ^
+           libssl.lib ^
+           libcrypto.lib ^
+           ws2_32.lib ^
+           advapi32.lib ^
+           user32.lib ^
+           crypt32.lib ^
+           gdi32.lib
 
+    - name: Verify x64 build
+      shell: cmd
+      run: |
+        echo === File size ===
+        dir build-x64\ftpsmin.exe
+        echo.
+        echo === Dependencies (should only show KERNEL32.dll, etc) ===
+        dumpbin /dependents build-x64\ftpsmin.exe
+
+    # ==================== BUILD x86 ====================
     - name: Setup MSVC x86
       uses: ilammy/msvc-dev-cmd@v1
       with:
         arch: x86
-
-    - name: Cache OpenSSL x86
-      id: cache-openssl-x86
-      uses: actions/cache@v3
-      with:
-        path: C:\OpenSSL-x86
-        key: Win32OpenSSL-3_6_0
-
-    - name: Download OpenSSL x86
-      if: steps.cache-openssl-x86.outputs.cache-hit != 'true'
-      shell: powershell
-      run: |
-        $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri "https://slproweb.com/download/Win32OpenSSL-3_6_0.exe" -OutFile "openssl-installer-x86.exe"
-        Start-Process -FilePath "openssl-installer-x86.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=C:\OpenSSL-x86" -Wait
 
     - name: Build x86
       shell: cmd
       run: |
         mkdir build-x86
         cd build-x86
-        cl /nologo /O2 /W3 /MD /D_CRT_SECURE_NO_WARNINGS /DWIN32 /D_WINDOWS ^
-           /IC:\OpenSSL-x86\include ^
+        
+        cl /nologo /O2 /W3 /MT /D_CRT_SECURE_NO_WARNINGS /DWIN32 /D_WINDOWS ^
+           /I"C:\vcpkg\installed\x86-windows-static\include" ^
            /Fe:ftpsmin.exe ^
-           ..\src\ftpsmin.c ..\src\config.c ..\src\service.c ^
-           ..\src\ssl_support.c ..\src\utf8_support.c ..\src\vfs.c ^
-           /link /LIBPATH:C:\OpenSSL-x86\lib\VC\x86\MT ^
-           libssl.lib libcrypto.lib ws2_32.lib advapi32.lib user32.lib crypt32.lib
+           ..\src\ftpsmin.c ^
+           ..\src\config.c ^
+           ..\src\service.c ^
+           ..\src\ssl_support.c ^
+           ..\src\utf8_support.c ^
+           ..\src\vfs.c ^
+           /link /SUBSYSTEM:CONSOLE ^
+           /LIBPATH:"C:\vcpkg\installed\x86-windows-static\lib" ^
+           libssl.lib ^
+           libcrypto.lib ^
+           ws2_32.lib ^
+           advapi32.lib ^
+           user32.lib ^
+           crypt32.lib ^
+           gdi32.lib
 
+    - name: Verify x86 build
+      shell: cmd
+      run: |
+        echo === File size ===
+        dir build-x86\ftpsmin.exe
+        echo.
+        echo === Dependencies (should only show KERNEL32.dll, etc) ===
+        dumpbin /dependents build-x86\ftpsmin.exe
+
+    # ==================== PACKAGE ====================
     - name: Create release packages
       shell: powershell
       run: |
         $version = "${{ steps.version.outputs.version }}"
         
+        # Create release directory
+        New-Item -ItemType Directory -Path "release" -Force
+        
         # x64 package
-        New-Item -ItemType Directory -Path "release\ftpsmin-$version-win64" -Force
-        Copy-Item "build-x64\ftpsmin.exe" "release\ftpsmin-$version-win64\"
-        Copy-Item "README.md" "release\ftpsmin-$version-win64\" -ErrorAction SilentlyContinue
-        Copy-Item "LICENSE" "release\ftpsmin-$version-win64\" -ErrorAction SilentlyContinue
+        $x64Dir = "release\ftpsmin-$version-win64"
+        New-Item -ItemType Directory -Path $x64Dir -Force
+        Copy-Item "build-x64\ftpsmin.exe" "$x64Dir\"
+        Copy-Item "README.md" "$x64Dir\" -ErrorAction SilentlyContinue
+        Copy-Item "LICENSE" "$x64Dir\" -ErrorAction SilentlyContinue
         
-        # Generate sample config
-        Push-Location "release\ftpsmin-$version-win64"
-        #.\ftpsmin.exe -genconfig
-        #Rename-Item "ftpsmin.json" "ftpsmin.json.example"
-        Pop-Location
-        
-        # Create zip
-        Compress-Archive -Path "release\ftpsmin-$version-win64" -DestinationPath "release\ftpsmin-$version-win64.zip"
+        # Create x64 zip
+        Compress-Archive -Path $x64Dir -DestinationPath "release\ftpsmin-$version-win64.zip" -Force
         
         # x86 package
-        New-Item -ItemType Directory -Path "release\ftpsmin-$version-win32" -Force
-        Copy-Item "build-x86\ftpsmin.exe" "release\ftpsmin-$version-win32\"
-        Copy-Item "README.md" "release\ftpsmin-$version-win32\" -ErrorAction SilentlyContinue
-        Copy-Item "LICENSE" "release\ftpsmin-$version-win32\" -ErrorAction SilentlyContinue
+        $x86Dir = "release\ftpsmin-$version-win32"
+        New-Item -ItemType Directory -Path $x86Dir -Force
+        Copy-Item "build-x86\ftpsmin.exe" "$x86Dir\"
+        Copy-Item "README.md" "$x86Dir\" -ErrorAction SilentlyContinue
+        Copy-Item "LICENSE" "$x86Dir\" -ErrorAction SilentlyContinue
         
-        Push-Location "release\ftpsmin-$version-win32"
-        #.\ftpsmin.exe -genconfig
-        #Rename-Item "ftpsmin.json" "ftpsmin.json.example"
-        Pop-Location
+        # Create x86 zip
+        Compress-Archive -Path $x86Dir -DestinationPath "release\ftpsmin-$version-win32.zip" -Force
         
-        Compress-Archive -Path "release\ftpsmin-$version-win32" -DestinationPath "release\ftpsmin-$version-win32.zip"
+        # Show results
+        Write-Host "=== Release packages ===" -ForegroundColor Green
+        Get-ChildItem "release\*.zip" | ForEach-Object {
+            Write-Host "$($_.Name): $([math]::Round($_.Length / 1MB, 2)) MB"
+        }
 
     - name: Generate checksums
       shell: powershell
@@ -144,15 +187,40 @@ jobs:
           $hash = Get-FileHash -Path $file.FullName -Algorithm SHA256
           "$($hash.Hash)  $($file.Name)"
         }
-        $checksums | Out-File -Encoding UTF8 "checksums-sha256.txt"
+        $checksums | Out-File -Encoding UTF8 -NoNewline "checksums-sha256.txt"
+        
+        Write-Host "=== Checksums ===" -ForegroundColor Green
         Get-Content "checksums-sha256.txt"
 
-    - name: Create Release
+    - name: Upload artifacts (for debugging)
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-packages
+        path: release/*.zip
+        retention-days: 5
+
+    - name: Create GitHub Release
       uses: softprops/action-gh-release@v1
       if: startsWith(github.ref, 'refs/tags/')
       with:
         name: ftpsmin v${{ steps.version.outputs.version }}
         draft: false
+        prerelease: false
+        generate_release_notes: true
+        files: |
+          release/*.zip
+          release/checksums-sha256.txt
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # Optional: Also create release on manual trigger
+    - name: Create GitHub Release (manual)
+      uses: softprops/action-gh-release@v1
+      if: github.event_name == 'workflow_dispatch'
+      with:
+        tag_name: v${{ steps.version.outputs.version }}
+        name: ftpsmin v${{ steps.version.outputs.version }}
+        draft: true
         prerelease: false
         generate_release_notes: true
         files: |

@@ -194,7 +194,7 @@ void SetDefaultConfig(ServerConfig *config)
     strcpy(config->keyFile, "server.key");
     
     config->requireAuth = FALSE;
-    strcpy(config->username, "anonymous");
+    strcpy(config->username, "Anonymous");
     config->password[0] = '\0';
     
     config->defaultUtf8 = TRUE;
